@@ -1,1 +1,1 @@
-# Coursera-week6
+# DOTA2 predictions educational project
