@@ -17,7 +17,7 @@ from mlxtend.classifier import StackingCVClassifier
 from lightgbm import LGBMClassifier
 from xgboost import XGBClassifier
 
-# doubles train data, based on idea of interchangeble heros in dire and radiant teams
+# doubles train data, based on idea of interchangeble heroes in dire and radiant teams
 
 def data_doubling(df):
     df2 = df.copy(deep=True)
@@ -35,7 +35,7 @@ def data_doubling(df):
                 df2_col[j]=col1
         j+=1
     
-    # assigning team 0/1 columns 'tower_kill_team','aegis_team','tower_deny_team'
+    # assigning team -1/1 columns 
     for field in ['first_blood_team','tower_kill_team','aegis_team','tower_deny_team']:
         df2[field] = df2[field].map({1:-1,-1:1})
    
@@ -77,7 +77,8 @@ def add_team_2 (df,fields):
         df['mean' + c + '_ratio'] = df['r_mean' + c] / (df['d_mean' + c]+1)
         
        
-# one-hot encoding of hero id +1 for radiant, -1 for dire    
+# one-hot encoding of hero id +1 for radiant, -1 for dire 
+
 def heroes_encoding(df):
     N = 121
     X_pick = np.zeros((df.shape[0], N))
@@ -92,7 +93,6 @@ def heroes_encoding(df):
     for i in range(5):
         del df['r%d_hero' % (i+1)]
         del df['d%d_hero' % (i+1)]
-
 
 def item_deletion(df):
     for col in df.columns:
@@ -114,18 +114,10 @@ def remap_teams(df):
 # timer on
 start_time = datetime.datetime.now()
 
-# data loading
+# data loading, you obiosly need to change the path to your data
 df = pd.read_csv(r'DATA_csv\VHS_output-2021-02-25.csv', index_col='match_id')
 df_test = pd.read_csv(r'DATA_csv\VHS_output_test-2021-02-25.csv', index_col='match_id')
-df_a = pd.read_csv(r'DATA_csv\VHS_output_abil.csv', index_col='match_id')
-df_at = pd.read_csv(r'DATA_csv\VHS_output_test_abil.csv', index_col='match_id')
 
-for i in range(1,6):
-    df['r%d_ability_upgrades' %i]=df_a['r%d_ability_upgrades' %i]
-    df['d%d_ability_upgrades' %i]=df_a['d%d_ability_upgrades' %i]
-    
-    df_test['r%d_ability_upgrades' %i]=df_at['r%d_ability_upgrades' %i]
-    df_test['d%d_ability_upgrades' %i]=df_at['d%d_ability_upgrades' %i]
 
 # deliting columns with negative influence
 fields = ['first_blood_player1','first_blood_player2','start_time']
@@ -133,7 +125,7 @@ for col in fields: del df[col]; del df_test[col]
 
 # DATA PREPARATION
 
-# fileds combining, '_buybacks','_ability_upgrades'
+# fileds for team combining
 fields = ['_kills', '_deaths', '_gold', '_lh', '_xp', '_level','_items','_ability_upgrades','_buybacks']
 
 # data processing, normalization and split
