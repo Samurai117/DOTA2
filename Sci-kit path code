@@ -1,80 +1,24 @@
 import pandas as pd
-import time
 import datetime
 import numpy as np
-import csv
-import seaborn as sns
-import itertools
-import scipy.optimize as opt
-import pylab as pl
-import math
-import matplotlib.pyplot as plt
-import matplotlib as mpl
 
 from sklearn.model_selection import train_test_split
-
-from sklearn.metrics import mean_squared_error
-from sklearn.metrics import log_loss
 from sklearn.metrics import roc_auc_score
 from sklearn.metrics import make_scorer
 from sklearn.metrics import accuracy_score
-from sklearn.metrics import confusion_matrix
-from sklearn.metrics import jaccard_score
-from sklearn.metrics import classification_report
-
 from sklearn.model_selection import KFold
-from sklearn.model_selection import cross_val_score
-from sklearn.model_selection import cross_validate
-from sklearn.model_selection import cross_val_predict
-
 from sklearn import preprocessing
-from sklearn.preprocessing import MinMaxScaler
-
 from sklearn.linear_model import LogisticRegression
-from sklearn.ensemble import GradientBoostingClassifier
-from sklearn.svm import LinearSVC, SVC
-from sklearn.linear_model import SGDClassifier
-from sklearn.neighbors import KNeighborsClassifier
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.ensemble import AdaBoostClassifier
-from sklearn.ensemble import VotingClassifier
-from sklearn.tree import DecisionTreeClassifier
+from catboost import CatBoostClassifier
 
-from catboost import CatBoostClassifier, Pool
+# stacking
+from mlxtend.classifier import StackingCVClassifier
+from lightgbm import LGBMClassifier
+from xgboost import XGBClassifier
 
-from sklearn.feature_selection import SelectKBest
-from sklearn.feature_selection import chi2
+# doubles train data, based on idea of interchangeble heroes in dire and radiant teams
 
-import torch 
-import torch.nn as nn
-import torchvision.transforms as transforms
-import torchvision.datasets as dsets
-import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader, random_split
-
-# timer on
-start_time = datetime.datetime.now()
-
-# data loading
-#df = pd.read_csv(r'DATA_csv\VHS_output.csv', index_col='match_id')
-#df_test = pd.read_csv(r'DATA_csv\VHS_output_test.csv', index_col='match_id')
-
-df = pd.read_csv(r'DATA_csv\features.csv', index_col='match_id')
-df_test = pd.read_csv(r'DATA_csv\features_test.csv', index_col='match_id')
-
-# excessiv data
-
-del df['duration']
-del df['tower_status_radiant']
-del df['tower_status_dire']
-del df['barracks_status_radiant']
-del df['barracks_status_dire']
-
-#df.fillna(value=df.median(), inplace=True)
-df.fillna(value=0, inplace=True)
-
-# preprocessing
-# switch r and d teams, with coordinat fix
 def data_doubling(df):
     df2 = df.copy(deep=True)
     df2['radiant_win']=df2['radiant_win'].map({1: 0, 0: 1})
@@ -83,20 +27,20 @@ def data_doubling(df):
     # assigning hero columns
     for col in df2.columns:
         for i in range(5):
-            if col.count('r%d' %(i+1))>0: 
+            if col.count('r%d_' %(i+1))>0: 
                 col1 = col.replace('r%d' %(i+1),'d%d' %(i+1))
                 df2_col[j]=col1
-            elif col.count('d%d' %(i+1))>0:
+            elif col.count('d%d_' %(i+1))>0:
                 col1 = col.replace('d%d' %(i+1),'r%d' %(i+1))
                 df2_col[j]=col1
         j+=1
     
-    # assigning team 0/1 columns
-    #['tower_kill_team','aegis_team','tower_deny_team','first_blood_team']
-    for field in ['first_blood_team']:
-        df2[field] = df2[field].map({1:0,0:1})
-    
+    # assigning team -1/1 columns 
+    for field in ['first_blood_team','tower_kill_team','aegis_team','tower_deny_team']:
+        df2[field] = df2[field].map({1:-1,-1:1})
+   
     # assigning items column
+    
     cols =[]
     for col in df.columns:
         if col.count('dire')>0:
@@ -107,8 +51,8 @@ def data_doubling(df):
         df2['dire%s' % field] = df2['tmp']
     del df2['tmp']
     
-    # assigning player
-    
+   
+    # new index
     df2.columns = df2_col           
     temp_index = list(df2.index)
     temp_index = [x+200000 for x in temp_index]
@@ -116,13 +60,8 @@ def data_doubling(df):
     df = pd.concat([df,df2])
     return df
 
-cols =[]
-for col in df.columns:
-    if col.count('dire')>0:
-        cols.append(col.replace('dire',''))
-        
-
 # add team fields
+
 def add_team_2 (df,fields):
     
     for c in fields:
@@ -131,18 +70,15 @@ def add_team_2 (df,fields):
         
         df['r_std' + c] = df[r_columns].std(1)
         df['d_std' + c] = df[d_columns].std(1)
-        df['std' + c + 'ratio'] = df['r_std' + c] / (df['d_std' + c]+1)
+        df['std' + c + '_ratio'] = df['r_std' + c] / (df['d_std' + c]+1)
         
         df['r_mean' + c] = df[r_columns].mean(1)
         df['d_mean' + c] = df[d_columns].mean(1)
         df['mean' + c + '_ratio'] = df['r_mean' + c] / (df['d_mean' + c]+1)
         
-        #df['r_time'+c] = df[r_columns].mean(1)/(df['game_time']+1)
-        #df['d_time'+c] = df[d_columns].mean(1)/(df['game_time']+1)
-        #df['time'+c+'_ratio'] = df['r_time'+c]/(df['d_time'+c]+1)
-        
-    
-# one-hot encoding of hero id +1 for radiant, -1 for dire    
+       
+# one-hot encoding of hero id +1 for radiant, -1 for dire 
+
 def heroes_encoding(df):
     N = 121
     X_pick = np.zeros((df.shape[0], N))
@@ -157,79 +93,95 @@ def heroes_encoding(df):
     for i in range(5):
         del df['r%d_hero' % (i+1)]
         del df['d%d_hero' % (i+1)]
-        
 
-def item_deletion(df,fields):
-    for field in fields:
-        del df['radiant%s' %field]
-        del df['dire%s' %field]
+def item_deletion(df):
+    for col in df.columns:
+        if col.count('_count')>0:
+            del df[col]
+    return df
+
+def time_revers(df):
+    for col in df.columns:
+        if col.count('_time')>0:
+            df[col]=df[col].apply(lambda x: 0 if x == None else 300-x)
+    return df
+
+def remap_teams(df):
+    for field in ['first_blood_team','tower_kill_team','aegis_team','tower_deny_team']:
+        df[field] = df[field].map({0:-1})
+    return df
+
+# timer on
+start_time = datetime.datetime.now()
+
+# data loading, you obiosly need to change the path to your data
+df = pd.read_csv(r'DATA_csv\VHS_output-2021-02-25.csv', index_col='match_id')
+df_test = pd.read_csv(r'DATA_csv\VHS_output_test-2021-02-25.csv', index_col='match_id')
+
+
+# deliting columns with negative influence
+fields = ['first_blood_player1','first_blood_player2','start_time']
+for col in fields: del df[col]; del df_test[col]
 
 # DATA PREPARATION
 
-# fileds combining
-fields = ['_kills', '_deaths', '_gold', '_lh', '_xp', '_level','_items',]
-#'_buybacks' - deleted
+# fileds for team combining
+fields = ['_kills', '_deaths', '_gold', '_lh', '_xp', '_level','_items','_ability_upgrades','_buybacks']
 
 # data processing, normalization and split
 
-# item fields to delete
-#'_bottle_time','_courier_time','_flying_courier_time', '_tpscroll_count', 
-#'_boots_count', '_ward_observer_count','_ward_sentry_count', '_first_ward_time'
-fields2 = ['_tpscroll_count','_boots_count', '_ward_observer_count','_ward_sentry_count']
-
+df = remap_teams(df)
 df = data_doubling(df)
 heroes_encoding(df)
 add_team_2(df,fields)
-item_deletion(df,fields2)
-
+df = time_revers(df)
+df = item_deletion(df)
 df.fillna(value=0, inplace=True)
-#df.fillna(value=df.median(), inplace=True)
-
 y = df['radiant_win']
-del df['radiant_win']
 
-del df['first_blood_player1']
-del df['first_blood_player2']
-
-#del df['aegis_team']
-#del df['tower_deny_team']
-#del df['first_blood_team']
-#del df['aegis_time']
-#del df['tower_deny_time']
-#del df['first_blood_time']
+df1 = df.copy()
+del df1['radiant_win']
  
 # normalized data
-X = preprocessing.StandardScaler().fit(df).transform(df)
+Scaler = preprocessing.StandardScaler()
+X = Scaler.fit(df1).transform(df1)
 X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.1, random_state=241)
 
 # non-normalized data
-X_cat = df.values
+X_cat = df1.values
 X_cat_train, X_cat_test, y_cat_train, y_cat_test = train_test_split(X_cat, y, test_size=0.1, random_state=241)
 
-# test data
+
+# TEST DATA
+df = remap_teams(df)
 heroes_encoding(df_test)
 add_team_2(df_test,fields)
+df_test = time_revers(df_test)
+df_test = item_deletion(df_test)
 df_test.fillna(value=0, inplace=True)
 
 # normilized test data
-XX = preprocessing.StandardScaler().fit(df_test).transform(df_test)
+XX = Scaler.transform(df_test)
 
 # non-normilized test data
-XX = df_test.values
+XX_cat = df_test.values
 
 print('Time elapsed, data prep:', datetime.datetime.now() - start_time)
 
+# cross-validation methods
+scoring = {'AUC': 'roc_auc', 'Accuracy': make_scorer(accuracy_score)}
+kf = KFold(n_splits=5, random_state=241, shuffle=True)
 
-# Simple Logistic Regression
+# LightGBM
 start_time_l = datetime.datetime.now()
-LR = LogisticRegression(C=1, solver='sag', max_iter = 10000, random_state=241, n_jobs = -1,
-                        multi_class='ovr', verbose = 10).fit(X_train,y_train)
-yhat = LR.predict(X_test)
-print('AUC, simple LR',roc_auc_score(y_test, yhat))
-#print('My roc_auc, simple LR',roc_auc_my(y_test, yhat))
-print('Accuracy, simple LR',accuracy_score(y_test, yhat))
-print ('Time elapsed, simple LR:', datetime.datetime.now() - start_time_l)
-
+lgbm = LGBMClassifier()
+lgbm.fit(X_train,y_train)
+yhat = lgbm.predict_proba(X_test)[:,1]
+yhat1 = lgbm.predict(X_test)
+print('\nLGBM')
+print('LGBM, AUC',roc_auc_score(y_test, yhat))
+print('LGBM,Accuracy',accuracy_score(y_test, yhat1))
+print ('Time elapsed, LGBM:', datetime.datetime.now() - start_time_l)
 
 
 #CatBoost, best los ='MultiClassOneVsAll',iter = 500, lr=1, depth =2
@@ -240,103 +192,55 @@ cat = CatBoostClassifier(iterations=500,
                          loss_function='MultiClassOneVsAll',
                          random_state=241,
                          logging_level='Silent')
-#test_data = Pool(X_train, y_train)
 cat.fit(X_cat_train,y_cat_train)
-print('CatBoost')
-#print('AUC',cat.eval_metrics(test_data))
-#print('Accuracy',cat.score(test_data))
-print(roc_auc_score(y_test, cat.predict(X_cat_test)))
-print(accuracy_score(y_test, cat.predict(X_cat_test)))
+print('\nCatBoost')
+yhat = cat.predict_proba(X_cat_test)[:,1]
+yhat1 = cat.predict(X_cat_test)
+print('Catboost, AUC',roc_auc_score(y_cat_test, yhat))
+print('Catboost, Accuracy',accuracy_score(y_cat_test, yhat1))
 print ('Time elapsed, CatBoost:', datetime.datetime.now() - start_time_l)
 
-# cross-validation methods
-scoring = {'AUC': 'roc_auc', 'Accuracy': make_scorer(accuracy_score)}
-kf = KFold(n_splits=5, random_state=241, shuffle=True)
-
 """
-# Log Reg, best parameters: c = 1  solver = sag
+# Simple Logistic Regression
 start_time_l = datetime.datetime.now()
-LR = LogisticRegression(C=1, solver='sag', max_iter = 10000, random_state=241)
-cross_val_LR = cross_validate(LR, X_train, y_train, cv=kf, scoring=scoring, return_estimator=True, n_jobs=-1)
-#proba = cross_val_predict(LR, X, y, cv=kf, method='predict_proba')
-print('Log Reg')
-print('AUC',cross_val_LR['test_AUC'])
-print('Accuracy',cross_val_LR['test_Accuracy'])
-cv_est_lr = cross_val_LR['estimator'][4]
-print('AUC',roc_auc_score(y_test, cv_est_lr.predict(X_test)))
-print('Accuracy',accuracy_score(y_test, cv_est_lr.predict(X_test)))
-print ('Time elapsed, LR:', datetime.datetime.now() - start_time_l)
+LR = LogisticRegression(C=1, solver='sag', max_iter = 10000, random_state=241, n_jobs = -1).fit(X_train,y_train)
+yhat = LR.predict_proba(X_test)[:,1]
+yhat1 = LR.predict(X_test)
+print('\nLogReg')
+print('simple LR, AUC',roc_auc_score(y_test, yhat))
+print('simple LR, Accuracy',accuracy_score(y_test, yhat1))
+print ('Time elapsed, simple LR:', datetime.datetime.now() - start_time_l)
 """
 
-"""
-# Gradient Boost, cross-validation, best parameters: 3,40,1
+
+# stacking classifier, best fatures class = cat, rnf,lgbm, xgb,(LR) meta = LR, auc 7579(7586), accur 6871
 start_time_l = datetime.datetime.now()
-gbrc = GradientBoostingClassifier(max_depth=3, n_estimators=40,verbose=True, 
-                                  random_state=241,learning_rate=1)
-cross_val_gbrc = cross_validate(gbrc, X_cat_train, y_cat_train, cv=kf, 
-                                scoring=scoring,return_estimator=True, n_jobs=-1)
-cv_est_gb = cross_val_gbrc['estimator'][4]
-print('Gradient Boost')
-print('AUC',cross_val_gbrc['test_AUC'])
-print('Accuracy',cross_val_gbrc['test_Accuracy'])
-print(roc_auc_score(y_cat_test, cv_est_gb.predict(X_cat_test)))
-print(accuracy_score(y_cat_test, cv_est_gb.predict(X_cat_test)))
-print ('Time elapsed, GrBoost:', datetime.datetime.now() - start_time_l)
-
-"""
-
-"""#SGD
-sgd = SGDClassifier(random_state=241)
-cross_val_sgd = cross_validate(sgd, X_train, y_train, cv=kf, scoring=scoring,return_estimator=True)
-cv_est_sgd = cross_val_sgd['estimator'][4]
-print('SGD, stochastic')
-print(roc_auc_score(y_test, cv_est_sgd.predict(X_test)))
-print(accuracy_score(y_test, cv_est_sgd.predict(X_test)))
-"""
-
-"""#Random Forest
-rnf = RandomForestClassifier(random_state=241)
-cross_val_rnf = cross_validate(rnf, X_cat_train, y_cat_train, cv=kf, scoring=scoring,return_estimator=True, n_jobs=-1)
-cv_est_rnf = cross_val_rnf['estimator'][4]
-print('Random Forest')
-print('AUC',cross_val_rnf['test_AUC'])
-print('Accuracy',cross_val_rnf['test_Accuracy'])
-print(roc_auc_score(y_cat_test, cv_est_rnf.predict(X_cat_test)))
-print(accuracy_score(y_cat_test, cv_est_rnf.predict(X_cat_test)))
-"""
-
-"""#AdaBoost, 'SAMME', 200, lr=1
-ada = AdaBoostClassifier(algorithm='SAMME',n_estimators=200,random_state=241)
-cross_val_ada = cross_validate(ada, X_train, y_train, cv=kf, scoring=scoring,return_estimator=True, n_jobs=-1)
-cv_est_ada = cross_val_ada['estimator'][4]
-print('Ada')
-print(roc_auc_score(y_test, cv_est_ada.predict(X_test)))
-print(accuracy_score(y_test, cv_est_ada.predict(X_test)))
-"""
-
-"""
-#Ensemble classification
-rnf = RandomForestClassifier(random_state=241)
+cat = CatBoostClassifier(iterations=500, depth=2, learning_rate=1,loss_function='MultiClassOneVsAll',
+                         random_state=241,logging_level='Silent')
 LR = LogisticRegression(C=1, solver='sag', max_iter = 10000, random_state=241, n_jobs = -1)
-gbrc = GradientBoostingClassifier(max_depth=3, n_estimators=40,verbose=True, 
-                                  random_state=241,learning_rate=1)
-svc = LinearSVC(max_iter = 1000, random_state=241, C =1)
-sgd = SGDClassifier(loss='huber', random_state=241)
-DTreeC = DecisionTreeClassifier(max_depth = 5, random_state=241)
+rnf = RandomForestClassifier(n_estimators = 30, max_depth=10,random_state=241, n_jobs=-1)
+lgbm = LGBMClassifier()
+xgb = XGBClassifier()
 
-ensemble = VotingClassifier(estimators=[('Random Forest', rnf),('Log Reg', LR),('GradientBoost', gbrc)], 
-                            voting='soft',n_jobs=-1).fit(X_train,y_train)
+stack = StackingCVClassifier(classifiers=(lgbm, LR),
+                            verbose = 1,
+                            meta_classifier=LR,
+                            cv=2,
+                            use_probas=True,
+                            use_features_in_secondary=True,
+                            store_train_meta_features=True,
+                            shuffle=False,
+                            random_state=42,
+                            n_jobs=-1
+                            )
+stack.fit(X_train, y_train)
+print('ROC_AUC, Stack',roc_auc_score(y_test, stack.predict_proba(X_test)[:,1]))
+print('Accuracy, Stack',accuracy_score(y_test, stack.predict(X_test)))
+print ('Time elapsed, Stacking:', datetime.datetime.now() - start_time_l)
 
-print('The accuracy Ensamble:',ensemble.score(X_test,y_test))
-for clf in ensemble.named_estimators_.keys():
-    print(ensemble.named_estimators_[clf].score(X_test,y_test))
 """
-
+# saving predictions to file
+result_stack = stack.predict_proba(XX)[:,1]
+np.savetxt("Predict_proba.csv", result_stack, delimiter=",")
 """
-result_LR=cat.predict_proba(XX)[:,1]
-np.savetxt("LR.csv", result_LR, delimiter=",")
-
-result_LR=cv_est_lr.predict_proba(XX)[:,1]
-np.savetxt("LR_cv.csv", result_LR, delimiter=",")
-
-"""
+print ('Time elapsed, Total:', datetime.datetime.now() - start_time)
