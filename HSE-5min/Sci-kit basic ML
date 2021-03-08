@@ -222,7 +222,7 @@ rnf = RandomForestClassifier(n_estimators = 30, max_depth=10,random_state=241, n
 lgbm = LGBMClassifier()
 xgb = XGBClassifier()
 
-stack = StackingCVClassifier(classifiers=(lgbm, LR),
+stack = StackingCVClassifier(classifiers=(lgbm, cat, LR),
                             verbose = 1,
                             meta_classifier=LR,
                             cv=2,
