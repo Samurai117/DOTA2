@@ -1,0 +1,448 @@
+import pandas as pd
+import datetime
+import numpy as np
+from math import sqrt 
+import math
+
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import roc_auc_score
+from sklearn.metrics import make_scorer
+from sklearn.metrics import accuracy_score
+from sklearn.model_selection import KFold
+from sklearn import preprocessing
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from catboost import CatBoostClassifier
+import matplotlib.pyplot as plt
+
+# stacking
+from mlxtend.classifier import StackingCVClassifier
+from lightgbm import LGBMClassifier
+from xgboost import XGBClassifier
+
+import torch 
+import torch.nn as nn
+import torchvision.transforms as transforms
+import torchvision.datasets as dsets
+import torch.nn.functional as F
+import matplotlib.pylab as plt
+from torch.utils.data import Dataset, DataLoader, random_split
+
+torch.manual_seed(0)
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+# doubles train data, based on idea of interchangeble heroes in dire and radiant teams
+
+def data_doubling(df):
+    df2 = df.copy(deep=True)
+    df2['radiant_win']=df2['radiant_win'].map({1: 0, 0: 1})
+    df2_col =df2.columns.tolist()
+    j = 0
+    # assigning hero columns
+    for col in df2.columns:
+        for i in range(5):
+            if col.count('r%d_' %(i+1))>0: 
+                col1 = col.replace('r%d' %(i+1),'d%d' %(i+1))
+                df2_col[j]=col1
+            elif col.count('d%d_' %(i+1))>0:
+                col1 = col.replace('d%d' %(i+1),'r%d' %(i+1))
+                df2_col[j]=col1
+        j+=1
+    
+    # assigning team 0/1 columns 'tower_kill_team','aegis_team','tower_deny_team'
+    for field in ['first_blood_team','tower_kill_team','aegis_team','tower_deny_team']:
+        df2[field] = df2[field].map({1:-1,-1:1})
+   
+    # assigning items column
+    
+    cols =[]
+    for col in df.columns:
+        if col.count('dire')>0:
+            cols.append(col.replace('dire',''))
+    for field in cols:
+        df2['tmp']=df2['radiant%s' % field]
+        df2['radiant%s' % field] = df2['dire%s' % field]
+        df2['dire%s' % field] = df2['tmp']
+    del df2['tmp']
+    
+   # new index
+    df2.columns = df2_col           
+    temp_index = list(df2.index)
+    temp_index = [x+200000 for x in temp_index]
+    df2.index = temp_index
+    df = pd.concat([df,df2])
+    return df
+
+# sigmoid function
+def sigmoid1(x):
+    return 1/(1+math.exp(-x))
+
+# make team dataset        
+def data_split_NN(df,fields):
+    df_team=df.iloc[:,0:5].copy()
+    for c in fields:
+        r_columns = [f'r{i}{c}' for i in range(1, 6)]
+        d_columns = [f'd{i}{c}' for i in range(1, 6)]
+        
+        df_team['r_std' + c] = df[r_columns].std(1)
+        df_team['d_std' + c] = df[d_columns].std(1)
+        df_team['std' + c + 'ratio'] = df_team['r_std' + c] / (df_team['d_std' + c]+1)
+        
+        df_team['r_mean' + c] = df[r_columns].mean(1)
+        df_team['d_mean' + c] = df[d_columns].mean(1)
+        df_team['mean' + c + '_ratio'] = df_team['r_mean' + c] / (df_team['d_mean' + c]+1)
+        
+    return df_team
+
+# add team fields
+def add_team_2 (df,fields):
+    
+    for c in fields:
+        r_columns = [f'r{i}{c}' for i in range(1, 6)]
+        d_columns = [f'd{i}{c}' for i in range(1, 6)]
+        
+        df['r_std' + c] = df[r_columns].std(1)
+        df['d_std' + c] = df[d_columns].std(1)
+        df['std' + c + '_ratio'] = df['r_std' + c] / (df['d_std' + c]+1)
+        
+        df['r_mean' + c] = df[r_columns].mean(1)
+        df['d_mean' + c] = df[d_columns].mean(1)
+        df['mean' + c + '_ratio'] = df['r_mean' + c] / (df['d_mean' + c]+1)
+        
+       
+# one-hot encoding of hero id +1 for radiant, -1 for dire    
+def heroes_encoding(df):
+    N = 121
+    X_pick = np.zeros((df.shape[0], N))
+    ii=0
+    for i in df.index:
+        for p in range(5):
+            X_pick[ii, int(df.loc[i, 'r%d_hero' % (p+1)])] = 1
+            X_pick[ii, int(df.loc[i, 'd%d_hero' % (p+1)])] = -1
+        ii+=1
+    for i in range(N):
+        df['hero_%d' % i]=X_pick[:,i]
+    for i in range(5):
+        del df['r%d_hero' % (i+1)]
+        del df['d%d_hero' % (i+1)]
+
+
+def item_deletion(df):
+    for col in df.columns:
+        if col.count('_count')>0:
+            del df[col]
+    return df
+
+def time_revers(df):
+    for col in df.columns:
+        if col.count('_time')>0:
+            df[col]=df[col].apply(lambda x: 0 if x == None else 300-x)
+    return df
+
+def remap_teams(df):
+    for field in ['first_blood_team','tower_kill_team','aegis_team','tower_deny_team']:
+        df[field] = df[field].map({0:-1})
+    return df
+
+# DNN setup
+
+# build Dataset
+class Dota2(Dataset):
+    def __init__(self, images, labels=None, transforms=None):
+        self.X = torch.from_numpy(images).type(torch.FloatTensor)
+        self.y = torch.from_numpy(labels).type(torch.LongTensor)
+        self.transforms = transforms
+    def __len__(self):
+        return (len(self.X))
+    def __getitem__(self, i):
+        data = self.X[i]
+        if self.transforms:
+            data = self.transforms(data)
+        if self.y is not None:
+            return (data, self.y[i])
+        else:
+            return data
+
+# Create the model class using sigmoid as the activation function
+class Net(nn.Module):
+    # Constructor
+    def __init__(self, D_in, H1, H2, D_out,p=0):
+        super(Net, self).__init__()
+        self.drop = nn.Dropout(p=p)
+        self.linear1 = nn.Linear(D_in, H1)
+        self.linear2 = nn.Linear(H1, H2)
+        self.linear3 = nn.Linear(H2, D_out)
+    # Prediction
+    def forward(self,x):
+        x = torch.sigmoid(self.drop(self.linear1(x))) 
+        x = torch.sigmoid(self.drop(self.linear2(x))) 
+        x = self.linear3(x)
+        return x
+
+# Train the model
+def train(model, criterion, train_loader, validation_loader, optimizer, test_data, epochs=100, test=False):
+    i = 0
+    useful_stuff = {'training_loss': [], 'validation_accuracy': [],
+                    'AUC_ROC':[], 
+                    'y_pred':[],
+                    'y_train_pass':[],'y_train':[],
+                    'y_test_pass':[],'y_test':[],}  
+    
+    # model train    
+    for epoch in range(epochs):
+        for i, (x, y) in enumerate(train_loader):
+            x, y = x.to(device), y.to(device)
+            optimizer.zero_grad()
+            z = model(x)
+            loss = criterion(z, y)
+            loss.backward()
+            optimizer.step()
+            useful_stuff['training_loss'].append(loss.data.item())
+        correct = 0
+        
+        # model validation
+        for x, y in validation_loader:
+            x, y = x.to(device), y.to(device)
+            z = model(x)
+            _, label = torch.max(z, 1)
+            Softmax_fn = nn.Softmax(dim=-1)
+            Probability = Softmax_fn(z)
+            correct += (label == y).sum().item()
+            # ROC_AUC
+            roc = roc_auc_score(y.cpu().detach().numpy(),Probability[:,1].cpu().detach().numpy())
+
+        useful_stuff['AUC_ROC'].append(roc*100)
+        accuracy = 100 * (correct / len(validation_dataset))
+        useful_stuff['validation_accuracy'].append(accuracy)
+        print('Epoch',epoch,'accuracy',accuracy)
+        print('Epoch',epoch,'AUC',roc*100)
+     #  print('Epoch',epoch,'loss',loss.data.item())
+    if test:
+        # prediction for new data       
+            for x,y in test_data:
+                x = x.to(device)
+                z = model(x)
+                _, label = torch.max(z, 1)
+                Softmax_fn = nn.Softmax(dim=-1)
+                Probability = Softmax_fn(z)
+                useful_stuff['y_pred'].append(Probability.cpu().detach().numpy())
+                
+        # train\test split predictions
+            for x,y in train_loader:
+                x = x.to(device)
+                z = model(x)
+                _, label = torch.max(z, 1)
+                Softmax_fn = nn.Softmax(dim=-1)
+                Probability = Softmax_fn(z)
+                useful_stuff['y_train_pass'].append(Probability.cpu().detach().numpy())
+                useful_stuff['y_train'].append(y.cpu().detach().numpy())    
+            for x,y in validation_loader:
+                x = x.to(device)
+                z = model(x)
+                _, label = torch.max(z, 1)
+                Softmax_fn = nn.Softmax(dim=-1)
+                Probability = Softmax_fn(z)
+                useful_stuff['y_test_pass'].append(Probability.cpu().detach().numpy())
+                useful_stuff['y_test'].append(y.cpu().detach().numpy())    
+    return useful_stuff
+
+# timer on
+start_time = datetime.datetime.now()
+
+# DATA LOADING
+df = pd.read_csv(r'DATA_csv\VHS_output-2021-02-25.csv', index_col='match_id')
+df_test = pd.read_csv(r'DATA_csv\VHS_output_test-2021-02-25.csv', index_col='match_id')
+df_a = pd.read_csv(r'DATA_csv\VHS_output_abil.csv', index_col='match_id')
+df_at = pd.read_csv(r'DATA_csv\VHS_output_test_abil.csv', index_col='match_id')
+
+for i in range(1,6):
+    df['r%d_ability_upgrades' %i]=df_a['r%d_ability_upgrades' %i]
+    df['d%d_ability_upgrades' %i]=df_a['d%d_ability_upgrades' %i]
+    
+    df_test['r%d_ability_upgrades' %i]=df_at['r%d_ability_upgrades' %i]
+    df_test['d%d_ability_upgrades' %i]=df_at['d%d_ability_upgrades' %i]
+
+# deleting columns with negative influence
+fields = ['first_blood_player1','first_blood_player2','start_time']
+for col in fields: del df[col]; del df_test[col]
+
+# DATA PREPARATION
+
+# fileds combining, '_buybacks','_ability_upgrades'
+fields = ['_kills', '_deaths', '_gold', '_lh', '_xp', '_level','_items','_ability_upgrades','_buybacks']
+
+# data processing, normalization and split
+
+df = remap_teams(df)
+df = data_doubling(df)
+heroes_encoding(df)
+add_team_2(df,fields)
+df = time_revers(df)
+df = item_deletion(df)
+df.fillna(value=0, inplace=True)
+y = df['radiant_win']
+df_team = data_split_NN(df,fields)
+
+df1 = df.copy()
+del df1['radiant_win']
+ 
+# normalized data
+Scaler = preprocessing.StandardScaler()
+Scaler_t = preprocessing.StandardScaler()
+X = Scaler.fit(df1).transform(df1)
+X_team = Scaler_t.fit(df_team).transform(df_team)
+
+# non-normalized data
+X_cat = df1.values
+
+
+# TEST DATA
+df_test = remap_teams(df_test)
+heroes_encoding(df_test)
+add_team_2(df_test,fields)
+df_test = time_revers(df_test)
+df_test = item_deletion(df_test)
+df_test.fillna(value=0, inplace=True)
+df_team_test = data_split_NN(df_test,fields)
+
+# normilized test data
+XX = Scaler.transform(df_test)
+XX_team = Scaler_t.transform(df_team_test)
+
+# non-normilized test data
+XX_cat_test = df_test.values
+XX_team_cat_test = df_team_test.values
+
+input_dim = X.shape[1]
+input_dim_t = X_team.shape[1]
+
+# Datasets
+X_total = np.concatenate((X_team, X, np.column_stack(y).T), axis=1)
+
+split_train, split_validation = train_test_split(X_total)
+
+X_test = Dota2(XX,np.zeros((XX.shape[0],1)))
+X_team_test = Dota2(XX_team,np.zeros((XX_team.shape[0],1)))
+
+train_dataset = Dota2(split_train[:,X_team.shape[1]:-1],split_train[:,-1])
+team_train_dataset = Dota2(split_train[:,0:X_team.shape[1]],split_train[:,-1])
+validation_dataset = Dota2(split_validation[:,X_team.shape[1]:-1],split_validation[:,-1])
+team_validation_dataset = Dota2(split_validation[:,0:X_team.shape[1]],split_validation[:,-1])
+
+# Create the training data loader and validation data loader object
+train_loader = torch.utils.data.DataLoader(dataset=train_dataset, batch_size=1000, shuffle=False)
+validation_loader = torch.utils.data.DataLoader(dataset=validation_dataset, batch_size=15000, shuffle=False)
+test_loader = torch.utils.data.DataLoader(dataset=X_test, batch_size=10000, shuffle=False)
+
+team_train_loader = torch.utils.data.DataLoader(dataset=team_train_dataset, batch_size=1000, shuffle=False)
+team_validation_loader = torch.utils.data.DataLoader(dataset=team_validation_dataset, batch_size=15000, shuffle=False)
+team_test_loader = torch.utils.data.DataLoader(dataset=X_team_test, batch_size=10000, shuffle=False)
+
+print ('Time elapsed, data prep:', datetime.datetime.now() - start_time)
+
+# Set the parameters for create the model
+input_dim = input_dim
+output_dim = 2
+cust_epochs = 30
+cust_epochs_t = 30
+cust_epochs_f = 50
+learning_rate = 1 #best lr
+dim_b = 100 
+dim_t = 100
+dim_f = 100
+#dropout
+p = 0
+
+# Create the criterion function
+criterion = nn.CrossEntropyLoss()
+
+# train BASE DATA model, 2 hidden layers optimal
+model = Net(input_dim, dim_b, dim_b, output_dim,p=p)
+model.to(device)
+optimizer = torch.optim.SGD(model.parameters(), lr=learning_rate)
+training_results = train(model, criterion, train_loader, validation_loader, optimizer,
+                         test_loader, epochs=cust_epochs, test=True)
+
+# train TEAM DATA model, 2 hidden layers optimal
+model_t = Net(input_dim_t, dim_t, dim_t, output_dim,p=p)
+model_t.to(device)
+optimizer = torch.optim.SGD(model_t.parameters(), lr=learning_rate)
+training_results_t = train(model_t, criterion, team_train_loader, team_validation_loader, optimizer,
+                         team_test_loader, epochs=cust_epochs_t, test=True)
+
+# train COMPOSIT model
+# Train data from BASE and TEAM models
+Train_Data = pd.DataFrame(np.concatenate(training_results['y_train_pass']))
+Train_Data_T = pd.DataFrame(np.concatenate(training_results_t['y_train_pass']))
+frames = [Train_Data,Train_Data_T]
+Train_X = pd.concat(frames, axis=1)
+
+Train_Data_y = pd.DataFrame(np.concatenate(training_results['y_train']))
+Train_Data_Ty = pd.DataFrame(np.concatenate(training_results_t['y_train']))
+frames = [Train_Data_y,Train_Data_Ty]
+Train_y = pd.concat(frames, axis=1)
+
+Train_y = pd.DataFrame(np.concatenate(training_results['y_train']))
+Train_final = Dota2(Train_X[0].values,Train_y.values.squeeze())
+
+# Validation data from BASE and TEAM models
+Test_Data = pd.DataFrame(np.concatenate(training_results['y_test_pass']))
+Test_Data_T = pd.DataFrame(np.concatenate(training_results_t['y_test_pass']))
+frames = [Test_Data,Test_Data_T]
+Test_X = pd.concat(frames, axis=1)
+
+Test_y = pd.DataFrame(np.concatenate(training_results['y_test']))
+Test_final = Dota2(Test_X[0].values,Test_y.values.squeeze())
+
+# TRUE test data from BASE and TEAM models
+TTest_Data = pd.DataFrame(np.concatenate(training_results['y_pred']))
+TTest_Data_T = pd.DataFrame(np.concatenate(training_results_t['y_pred']))
+frames = [TTest_Data,TTest_Data_T]
+TTest_X = pd.concat(frames, axis=1)
+
+TTest_y = np.zeros((XX.shape[0],1))
+TTest_final = Dota2(TTest_X[0].values,TTest_y.squeeze())
+
+# load Train\Test to DataLoader
+train_loader_f = torch.utils.data.DataLoader(dataset=Train_final, batch_size=1000, shuffle=False)
+validation_loader_f = torch.utils.data.DataLoader(dataset=Test_final, batch_size=15000, shuffle=False)
+test_loader_f = torch.utils.data.DataLoader(dataset=TTest_final, batch_size=10000, shuffle=False)
+
+# final composit model training
+model_c = Net(2, dim_f, dim_f, output_dim,p=p)
+model_c.to(device)
+optimizer = torch.optim.SGD(model_c.parameters(), lr=learning_rate)
+training_results_f = train(model_c, criterion, train_loader_f, validation_loader_f, optimizer,
+                         test_loader_f, epochs=cust_epochs_f, test=True)
+
+# Roc and Accuracy Base model
+plt.title('Base model')
+plt.plot(training_results['validation_accuracy'], label='Accuracy')
+plt.plot(training_results['AUC_ROC'], label='AUC_ROC')
+plt.ylabel('validation accuracy')
+plt.xlabel('Iteration')   
+plt.legend()
+plt.show()
+
+# Roc and Accuracy Team model
+plt.title('Team model')
+plt.plot(training_results_t['validation_accuracy'], label='Accuracy_team')
+plt.plot(training_results_t['AUC_ROC'], label='AUC_ROC_team')
+plt.ylabel('validation accuracy')
+plt.xlabel('Iteration')   
+plt.legend()
+plt.show()
+
+# Roc and Accuracy Final model
+plt.title('Final model')
+plt.plot(training_results_f['validation_accuracy'], label='Accuracy_final')
+plt.plot(training_results_f['AUC_ROC'], label='AUC_ROC_final')
+plt.ylabel('validation accuracy')
+plt.xlabel('Iteration')   
+plt.legend()
+plt.show()
+
+#result_NN = np.concatenate(training_results_f['y_pred'])
+#np.savetxt("LR.csv", result_NN[:,1], delimiter=",")
+
+print ('Time elapsed, total:', datetime.datetime.now() - start_time)
