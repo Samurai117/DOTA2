@@ -8,7 +8,7 @@ HSE project: https://www.kaggle.com/c/dota-2-win-probability-prediction/data
 
 HSE course: https://www.coursera.org/learn/vvedenie-mashinnoe-obuchenie#about
 
-Best results for presented ensamble ML version 76,24% on leaderboards. DNN version get better results on validation data but only 75.78% for real test.
+Best results for presented ensamble ML version 76,24% on leaderboards. DNN version gets better results on validation data but only 75.78% for real test.
 
 ### Second 
 This project is based on this Kaggle competition.
