@@ -1,0 +1,248 @@
+import os
+import ujson as json
+from tqdm.notebook import tqdm
+import pandas as pd
+import datetime
+import numpy as np
+import csv
+import collections
+
+MATCH_FEATURES = [
+    ('game_time', lambda m: m['game_time']),
+    ('game_mode', lambda m: m['game_mode']),
+    ('lobby_type', lambda m: m['lobby_type']),
+    ('objectives_len', lambda m: len(m['objectives'])),
+    ('chat_len', lambda m: len(m['chat'])),
+]
+
+PLAYER_FIELDS = [
+    'hero_id',
+    
+    'kills',
+    'deaths',
+    'assists',
+    'denies',
+    
+    'gold',
+    'lh',
+    'xp',
+    'health',
+    'max_health',
+    'max_mana',
+    'level',
+
+    'x',
+    'y',
+    
+    'stuns',
+    'creeps_stacked',
+    'camps_stacked',
+    'rune_pickups',
+    'firstblood_claimed',
+    'teamfight_participation',
+    'towers_killed',
+    'roshans_killed',
+    'obs_placed',
+    'sen_placed',
+]
+
+def read_matches(matches_file):
+    MATCHES_COUNT = {
+        'test_matches.jsonl': 10000,
+        'train_matches.jsonl': 39675,
+    }
+    _, filename = os.path.split(matches_file)
+    total_matches = MATCHES_COUNT.get(filename)
+    with open(matches_file) as fin:
+        for line in tqdm(fin, total=total_matches):
+            yield json.loads(line)
+            
+def extract_features_csv(match):
+    row = [
+        ('match_id_hash', match['match_id_hash']),
+    ]
+    
+    for field, f in MATCH_FEATURES:
+        row.append((field, f(match)))
+        
+    for slot, player in enumerate(match['players']):
+        if slot < 5:
+            player_name = 'r%d' % (slot + 1)
+        else:
+            player_name = 'd%d' % (slot - 4)
+
+        for field in PLAYER_FIELDS:
+            column_name = '%s_%s' % (player_name, field)
+            row.append((column_name, player[field]))
+        row.append((f'{player_name}_ability_level', len(player['ability_upgrades'])))
+        row.append((f'{player_name}_max_hero_hit', player['max_hero_hit']['value']))
+        row.append((f'{player_name}_purchase_count', len(player['purchase_log'])))
+        row.append((f'{player_name}_count_ability_use', sum(player['ability_uses'].values())))
+        row.append((f'{player_name}_damage_dealt', sum(player['damage'].values())))
+        row.append((f'{player_name}_damage_received', sum(player['damage_taken'].values())))
+        row.append((f'{player_name}_near_creeps_death', player['nearby_creep_death_count']))
+            
+    return collections.OrderedDict(row)
+
+def add_new_features(df_features, matches_file):
+    # Process raw data and add new features
+    for match in read_matches(matches_file):
+        match_id_hash = match['match_id_hash']
+        
+        # Counting ruined towers for both teams
+        radiant_tower_kills = 0
+        dire_tower_kills = 0
+        for objective in match['objectives']:
+            if objective['type'] == 'CHAT_MESSAGE_TOWER_KILL':
+                if objective['team'] == 2:
+                    radiant_tower_kills += 1
+                if objective['team'] == 3:
+                    dire_tower_kills += 1
+        # Write Tower Kill
+        df_features.loc[match_id_hash, 'radiant_tower_kills'] = radiant_tower_kills
+        df_features.loc[match_id_hash, 'dire_tower_kills'] = dire_tower_kills
+        df_features.loc[match_id_hash, 'diff_tower_kills'] = radiant_tower_kills - dire_tower_kills
+        
+        # Counting buybacks for both teams
+        buyback_r = 0
+        buyback_d = 0
+        for i in range (5):
+            for objective in match['players'][i]['buyback_log']:
+                buyback_r+=1
+            for objective in match['players'][i+5]['buyback_log']:
+                buyback_d+=1
+        # Write buyback
+        df_features.loc[match_id_hash, 'radiant_buybacks'] = buyback_r
+        df_features.loc[match_id_hash, 'dire_buybacks'] = buyback_d
+        
+       # add first blood timer
+        for i in range(len(match['objectives'])):
+            if match['objectives'][i]['type']=='CHAT_MESSAGE_FIRSTBLOOD':
+                if match['objectives'][i]['key']<5:
+                    df_features.loc[match_id_hash,'radiant_fb_time']=match['objectives'][i]['time']
+                else:
+                    df_features.loc[match_id_hash,'dire_fb_time']=match['objectives'][i]['time']
+        
+def extract_items_list(df_features,matches_file):
+    # Process raw data and add new features
+    item_list = []
+    for match in read_matches(matches_file):
+        # Counting buybacks for both teams
+        for i in range (10):
+            for objective in match['players'][i]['purchase']:
+                item_list.append(objective)
+    item_list = sorted(list(set(item_list)))
+    return item_list
+
+def extract_items_inventory_list(df_features,matches_file):
+    # Process raw data and add new features
+    item_list_inv = []
+    item_list_stash = []
+    for match in read_matches(matches_file):
+        # Counting buybacks for both teams
+        for i in range (10):
+            for objective in match['players'][i]['hero_inventory']:
+                item_list_inv.append(objective['id'])
+            for objective in match['players'][i]['hero_stash']:
+                item_list_stash.append(objective['id'])
+    item_list_inv = sorted(list(set(item_list_inv)))
+    item_list_stash = sorted(list(set(item_list_stash)))
+    return item_list_inv, item_list_stash
+
+def extract_purchase(df_features,matches_file):
+    item_list = []
+    for match in read_matches(matches_file):
+        for i in range(10):
+            for j in range(len(match['players'][i]['purchase_log'])):
+                item_list.append(match['players'][i]['purchase_log'][j]['key'])
+    item_list = sorted(list(set(item_list)))
+    return item_list
+
+def add_stash_inventory(df_features, matches_file,item_list):
+    # make new columns
+    for item in item_list:
+        df_features.loc[0,item+'_items_radiant'] = 0
+        df_features.loc[0,item+'_items_dire'] = 0
+        df_features.loc[0,item+'_time_radiant'] = 8000
+        df_features.loc[0,item+'_time_dire'] = 8000
+        
+    df_features.fillna(value=0, inplace=True)
+    
+    # Process raw data and add new features
+    for match in read_matches(matches_file):
+        match_id_hash = match['match_id_hash']
+                                
+        for i in range(5):
+            for j in range(len(match['players'][i]['purchase_log'])):
+                objective = match['players'][i]['purchase_log'][j]['key']
+                if df_features.loc[match_id_hash, objective+'_time_radiant'] > match['players'][i]['purchase_log'][j]['time']:
+                    df_features.loc[match_id_hash, objective+'_time_radiant'] = match['players'][i]['purchase_log'][j]['time']
+                    df_features.loc[match_id_hash, objective+'_items_radiant']+=1
+            for j in range(len(match['players'][i+5]['purchase_log'])):
+                objective = match['players'][i+5]['purchase_log'][j]['key']
+                if df_features.loc[match_id_hash, objective+'_time_dire'] > match['players'][i+5]['purchase_log'][j]['time']:
+                    df_features.loc[match_id_hash, objective+'_time_dire'] = match['players'][i+5]['purchase_log'][j]['time']
+                    df_features.loc[match_id_hash, objective+'_items_dire']+=1
+     
+    df_features.drop(index =0, inplace = True)      
+
+def extract_targets_csv(match, targets):
+    return collections.OrderedDict([('match_id_hash', match['match_id_hash'])] + [
+        (field, targets[field])
+        for field in ['game_time', 'radiant_win', 'duration', 'time_remaining', 'next_roshan_team']
+    ])
+
+
+# Timer ON
+start_time = datetime.datetime.now()
+
+PATH_TO_DATA = r'DATA_csv'
+df_new_features = []
+df_new_targets = []
+
+for match in read_matches(os.path.join(PATH_TO_DATA, 'train_matches.jsonl')):
+    match_id_hash = match['match_id_hash']
+    features = extract_features_csv(match)
+    targets = extract_targets_csv(match, match['targets'])
+    df_new_features.append(features)
+    df_new_targets.append(targets)
+
+df_new_features = pd.DataFrame.from_records(df_new_features).set_index('match_id_hash')
+df_new_targets = pd.DataFrame.from_records(df_new_targets).set_index('match_id_hash')
+
+test_new_features = []
+for match in read_matches(os.path.join(PATH_TO_DATA, 'test_matches.jsonl')):
+    match_id_hash = match['match_id_hash']
+    features = extract_features_csv(match)
+    test_new_features.append(features)
+    
+test_new_features = pd.DataFrame.from_records(test_new_features).set_index('match_id_hash')
+
+# copy the dataframe with features
+df_test_features_extended = test_new_features
+df_train_features_extended = df_new_features
+
+inv_train, stash_train = extract_items_inventory_list(df_train_features_extended,os.path.join('ML/','train_matches.jsonl'))
+inv_test, stash_test = extract_items_inventory_list(df_test_features_extended,os.path.join('ML/','test_matches.jsonl'))
+purchase_list = extract_purchase(df_test_features_extended,os.path.join('ML/','test_matches.jsonl'))
+
+inv_list = set(inv_train).union(set(inv_test))
+stash_list = set(stash_train).union(set(stash_test))
+purchase_list = set(purchase_list)
+
+item_list = list(inv_list.union(stash_list.union(purchase_list)))
+item_list.sort()
+
+#item_list = extract_items_list(df_train_features_extended,os.path.join('ML/','train_matches.jsonl'))
+
+# add new features
+add_stash_inventory(df_test_features_extended, os.path.join('ML/', 'test_matches.jsonl'),item_list)
+add_stash_inventory(df_train_features_extended, os.path.join('ML/', 'train_matches.jsonl'),item_list)
+
+add_new_features(df_test_features_extended,os.path.join('ML/','test_matches.jsonl'))
+add_new_features(df_train_features_extended,os.path.join('ML/','train_matches.jsonl'))
+
+# saving features to csv
+df_new_targets.to_csv('train_targets-01.csv')
+df_train_features_extended.to_csv('train-01.csv')
+df_test_features_extended.to_csv('test-01.csv')
