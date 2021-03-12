@@ -1,0 +1,275 @@
+import pandas as pd
+import datetime
+import numpy as np
+
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import roc_auc_score
+from sklearn.metrics import make_scorer
+from sklearn.metrics import accuracy_score
+from sklearn.model_selection import KFold
+from sklearn import preprocessing
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from catboost import CatBoostClassifier
+
+# stacking
+from mlxtend.classifier import StackingCVClassifier
+from lightgbm import LGBMClassifier
+from xgboost import XGBClassifier
+
+# fix the time values for items, delete empty columns
+def time_revers(df):
+    for col in df.columns:
+        if col.count('_time_')>0:
+            if df[col].sum()==0:
+                del df[col]
+            else:
+                df[col]=df[col].apply(lambda x: -100 if x == 0 else 800-x)
+    return df
+
+def item_del(df):
+    for col in df.columns:
+        if col.count('items_')>0:
+            del df[col]
+    return df
+
+
+# add team fields
+def add_team_2 (df,fields):
+    
+    df = item_del(df)
+    df = time_revers(df)
+    
+    for c in fields:
+        r_columns = [f'r{i}{c}' for i in range(1, 6)]
+        d_columns = [f'd{i}{c}' for i in range(1, 6)]
+        
+        df['r_std' + c] = df[r_columns].std(1)
+        df['d_std' + c] = df[d_columns].std(1)
+        df['std' + c + '_ratio'] = df['r_std' + c] / (df['d_std' + c]+1)
+        
+        df['r_mean' + c] = df[r_columns].mean(1)
+        df['d_mean' + c] = df[d_columns].mean(1)
+        df['mean' + c + '_ratio'] = df['r_mean' + c] / (df['d_mean' + c]+1)
+        
+        df['r_time'+c] = df[r_columns].mean(1)/(df['game_time']+1)
+        df['d_time'+c] = df[d_columns].mean(1)/(df['game_time']+1)
+        #df['time'+c+'_ratio'] = df['r_time'+c]/(df['d_time'+c]+1)
+    
+    r_columns = [f'r{i}_firstblood_claimed' for i in range(1, 6)]
+    d_columns = [f'd{i}_firstblood_claimed' for i in range(1, 6)]
+    df['radiant_first_blood']=df[r_columns].sum(1)
+    df['dire_first_blood']=df[d_columns].sum(1)
+    
+    df['radiant_fb_time'] = 800 - df['radiant_fb_time']
+    df['dire_fb_time'] = 800 - df['dire_fb_time']
+       
+# one-hot encoding of hero id +1 for radiant, -1 for dire    
+def heroes_encoding(df):
+    N = 121
+    X_pick = np.zeros((df.shape[0], N))
+    ii=0
+    for i in df.index:
+        for p in range(5):
+            X_pick[ii, int(df.loc[i, 'r%d_hero_id' % (p+1)])] = 1
+            X_pick[ii, int(df.loc[i, 'd%d_hero_id' % (p+1)])] = -1
+        ii+=1
+    for i in range(N):
+        df['hero_%d' % i]=X_pick[:,i]
+    for i in range(5):
+        del df['r%d_hero_id' % (i+1)]
+        del df['d%d_hero_id' % (i+1)]
+
+
+# switch r and d teams, with coorinat fix
+def data_doubling(df):
+    df2 = df.copy(deep=True)
+    df2['radiant_win']=df2['radiant_win'].map({1: 0, 0: 1})
+    df2_col =df2.columns.tolist()
+    j = 0
+    for col in df2.columns:
+        for i in range(5):
+            if col.count('r%d' %(i+1))>0: 
+                col1 = col.replace('r%d' %(i+1),'d%d' %(i+1))
+                df2_col[j]=col1
+            elif col.count('d%d' %(i+1))>0:
+                col1 = col.replace('d%d' %(i+1),'r%d' %(i+1))
+                df2_col[j]=col1
+        j+=1
+    
+    cols =[]
+    for col in df.columns:
+        if col.count('dire_')>0:
+            cols.append(col.replace('dire_',''))
+    for field in cols:
+        df2['tmp']=df2['radiant_%s' % field]
+        df2['radiant_%s' % field] = df2['dire_%s' % field]
+        df2['dire_%s' % field] = df2['tmp']
+    del df2['tmp']
+    
+    #item exchange
+    cols =[]
+    for col in df.columns:
+        if col.count('_dire')>0:
+            cols.append(col.replace('_dire',''))
+    for field in cols:
+        df2['tmp']=df2['%s_radiant' % field]
+        df2['%s_radiant' % field] = df2['%s_dire' % field]
+        df2['%s_dire' % field] = df2['tmp']
+    del df2['tmp']
+    
+    for col in df2.columns:
+        for i in range(5):
+            if col == ('r%d_x' %i) or col == ('r%d_y' %i) or col == ('d%d_x' %i) or col == ('d%d_y' %i):
+                df2[col]=df2[col].apply(lambda x: 256-x)
+    df2.columns = df2_col           
+    temp_index = list(df2.index)
+    temp_index = [x+'zzz' for x in temp_index]
+    df2.index = temp_index
+    df = pd.concat([df,df2])
+    return df
+
+# deleting excessive columns
+def bad_columns(df):
+    # to check for differenc: set(df.columns).difference(set(df_test.columns))
+    fields2 = ['cloak_time_dire',
+ 'power_treads_time_dire',
+ 'power_treads_time_radiant',
+ 'river_painted2_time_dire',
+ 'river_painted2_time_radiant',
+ 'river_painted3_time_dire',
+ 'river_painted3_time_radiant',
+ 'river_painted4_time_dire',
+ 'river_painted4_time_radiant',
+ 'river_painted5_time_dire',
+ 'river_painted5_time_radiant',
+ 'river_painter2_time_dire',
+ 'river_painter3_time_dire',
+ 'river_painter4_time_dire',
+ 'river_painter5_time_dire',
+ 'river_painter6_time_dire',
+ 'river_painter7_time_dire',
+ 'river_painter_time_dire'
+ ]
+    for i in fields2:
+        del df[i]
+    return df
+
+# timer ON
+start_time = datetime.datetime.now()
+
+# data loading
+df = pd.read_csv(r'DATA_csv\train-07.csv', index_col='match_id_hash')
+df_target = pd.read_csv(r'DATA_csv\train_targets-07.csv', index_col='match_id_hash')
+df_test = pd.read_csv(r'DATA_csv\test-07.csv', index_col='match_id_hash')
+df = pd.concat([df,df_target['radiant_win'].map({True: 1, False: 0})], axis=1)
+  
+# fileds combining, train
+fields = ['_kills', '_deaths', '_gold', '_lh', '_xp', '_health', '_max_health', '_max_mana', 
+ '_level', '_camps_stacked', '_rune_pickups', '_teamfight_participation', '_towers_killed', 
+ '_roshans_killed', '_obs_placed','_sen_placed',
+ '_stuns', '_assists', '_denies', '_x', '_y', '_creeps_stacked', 
+ '_max_hero_hit','_purchase_count','_count_ability_use','_damage_dealt','_damage_received',
+ '_near_creeps_death','_ability_level']
+
+# TRAIN DATA processing, normalization and split
+
+df = data_doubling(df)
+heroes_encoding(df)
+df = bad_columns(df)
+add_team_2(df,fields)
+df.fillna(value=0, inplace=True)
+
+# test data
+heroes_encoding(df_test)
+add_team_2(df_test,fields)
+df_test.fillna(value=0, inplace=True)
+
+# data normalization
+
+df1 = df.copy()
+Scaler = preprocessing.StandardScaler()
+y = df1.pop('radiant_win')
+X = Scaler.fit(df1).transform(df1)
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.1, random_state=241)
+
+X_cat = df1.values
+y_cat = y
+X_cat_train, X_cat_test, y_cat_train, y_cat_test = train_test_split(X_cat, y_cat, test_size=0.1, random_state=241)
+
+XX = Scaler.transform(df_test)
+
+print('Time elapsed, data prep:', datetime.datetime.now() - start_time)
+
+
+# PREDICTION
+
+# LightGBM
+start_time_l = datetime.datetime.now()
+lgbm = LGBMClassifier()
+lgbm.fit(X_train,y_train)
+yhat = lgbm.predict_proba(X_test)[:,1]
+yhat1 = lgbm.predict(X_test)
+print('\nLGBM')
+print('LGBM, AUC',roc_auc_score(y_test, yhat))
+print('LGBM,Accuracy',accuracy_score(y_test, yhat1))
+print ('Time elapsed, LGBM:', datetime.datetime.now() - start_time_l)
+
+#CatBoost, best los ='MultiClassOneVsAll',iter = 500, lr=1, depth =2
+start_time_l = datetime.datetime.now()
+cat = CatBoostClassifier(iterations=500,
+                         depth=2,
+                         learning_rate=1,
+                         loss_function='MultiClassOneVsAll',
+                         random_state=241,
+                         logging_level='Silent')
+cat.fit(X_cat_train,y_cat_train)
+print('\nCatBoost')
+yhat = cat.predict_proba(X_cat_test)[:,1]
+yhat1 = cat.predict(X_cat_test)
+print('Catboost, AUC',roc_auc_score(y_cat_test, yhat))
+print('Catboost, Accuracy',accuracy_score(y_cat_test, yhat1))
+print ('Time elapsed, CatBoost:', datetime.datetime.now() - start_time_l)
+
+
+# Simple Logistic Regression, converges on 10000 iterations
+start_time_l = datetime.datetime.now()
+LR = LogisticRegression(C=1, solver='sag', max_iter = 200, random_state=241, n_jobs = -1).fit(X_train,y_train)
+yhat = LR.predict_proba(X_test)[:,1]
+yhat1 = LR.predict(X_test)
+print('\nLogReg')
+print('simple LR, AUC',roc_auc_score(y_test, yhat))
+print('simple LR, Accuracy',accuracy_score(y_test, yhat1))
+print ('Time elapsed, simple LR:', datetime.datetime.now() - start_time_l)
+
+
+# stacking classifier, best fatures class = cat, rnf,lgbm, xgb,(LR) meta = LR, auc 7579(7586), accur 6871
+start_time_l = datetime.datetime.now()
+cat = CatBoostClassifier(iterations=500, depth=2, learning_rate=1,loss_function='MultiClassOneVsAll',
+                         random_state=241,logging_level='Silent')
+LR = LogisticRegression(C=1, solver='sag', max_iter = 2000, random_state=241, n_jobs = -1)
+rnf = RandomForestClassifier(n_estimators = 30, max_depth=10,random_state=241, n_jobs=-1)
+lgbm = LGBMClassifier()
+xgb = XGBClassifier()
+
+stack = StackingCVClassifier(classifiers=(lgbm, cat, LR),
+                            verbose = 1,
+                            meta_classifier=LR,
+                            cv=2,
+                            use_probas=True,
+                            use_features_in_secondary=True,
+                            store_train_meta_features=True,
+                            shuffle=False,
+                            random_state=42,
+                            n_jobs=-1
+                            )
+stack.fit(X_train, y_train)
+print('ROC_AUC, Stack',roc_auc_score(y_test, stack.predict_proba(X_test)[:,1]))
+print('Accuracy, Stack',accuracy_score(y_test, stack.predict(X_test)))
+print ('Time elapsed, Stacking:', datetime.datetime.now() - start_time_l)
+  
+# saving predictions to file
+result_stack = stack.predict_proba(XX)[:,1]
+np.savetxt("Stacking.csv", result_stack, delimiter=",")
+
+print ('Time elapsed, Total:', datetime.datetime.now() - start_time)
